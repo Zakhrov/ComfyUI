@@ -281,6 +281,8 @@ DANGEROUS_CONTENT_TYPES = {
     'text/javascript', 'application/javascript', 'application/x-javascript',
     'application/ecmascript', 'text/css',
     'image/svg+xml', 'application/xml', 'text/xml',
+    # Some platforms (e.g. openSUSE) map .xsl/.xslt to these instead of application/xslt+xml.
+    'text/xsl', 'text/x-xslt',
     # message/rfc822 (.mht/.mhtml) can carry script in some browsers.
     'message/rfc822',
 }
