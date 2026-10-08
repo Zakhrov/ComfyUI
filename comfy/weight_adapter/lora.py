@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 import comfy.model_management
+import comfy.ops
 from .base import (
     WeightAdapterBase,
     WeightAdapterTrainBase,
@@ -265,8 +266,8 @@ class LoRAAdapter(WeightAdapterBase):
                 .transpose(0, 1)
             )
         try:
-            lora_diff = torch.mm(
-                mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)
+            lora_diff = comfy.ops.dense_linear(
+                mat1.flatten(start_dim=1), mat2.flatten(start_dim=1).t()
             ).reshape(weight.shape)
             del mat1, mat2
             if dora_scale is not None:

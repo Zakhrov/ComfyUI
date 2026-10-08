@@ -616,6 +616,11 @@ class disable_weight_init:
         def reset_parameters(self):
             return None
 
+        def _conv_forward(self, input, weight, bias):
+            if _packed_conv_wanted(self, input, weight):
+                return dense_conv(self, input, weight, bias)
+            return super()._conv_forward(input, weight, bias)
+
         def forward_comfy_cast_weights(self, input):
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                 return self._conv_forward(input, weight, bias)
@@ -634,6 +639,8 @@ class disable_weight_init:
         def _conv_forward(self, input, weight, bias, autopad=None, *args, **kwargs):
             if autopad == "causal_zero":
                 weight = weight[:, :, -input.shape[2]:, :, :]
+            if _packed_conv_wanted(self, input, weight):
+                return dense_conv(self, input, weight, bias)
             if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
                 out = torch.cudnn_convolution(input, weight, self.padding, self.stride, self.dilation, self.groups, benchmark=False, deterministic=False, allow_tf32=True)
                 if bias is not None:
@@ -939,7 +946,7 @@ class fp8_ops(manual_cast):
                     logging.info("Exception during fp8 op: {}".format(e))
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                return _linear_residual(torch.nn.functional.linear(input, weight, bias), residual, residual_scale)
+                return _linear_residual(dense_linear(input, weight, bias), residual, residual_scale)
 
 CUBLAS_IS_AVAILABLE = False
 try:
@@ -1015,6 +1022,57 @@ def _linear_residual(out, residual, residual_scale):
     return out if residual is None else torch.addcmul(residual, out, residual_scale)
 
 
+_CK_PACKED = quant_ops._CK_AVAILABLE and hasattr(quant_ops.ck, "fp16_packed_linear_is_accelerated")
+_PACKED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _packed_linear_wanted(x, weight):
+    """kitchen's packed-fp16 GEMM replaces the vendor GEMM on devices where it is faster (gfx90c,
+    gfx1010: ~6 TFLOPS against ~2.5 fp32 and ~2.2 fp16 on gfx1010). Up to 8 rows stay on the
+    vendor GEMV, which the packed kernel would only hand back."""
+    return (_CK_PACKED and x.is_cuda and not comfy.model_management.in_training
+            and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
+            and not isinstance(weight, QuantizedTensor) and x.numel() > 8 * x.shape[-1]
+            and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
+
+
+def dense_linear(x, weight, bias=None):
+    """``linear(x)`` for a plain float weight, on kitchen's packed-fp16 GEMM where that is faster.
+    There the weight is taken to fp16 (one past fp16's range overflows to inf rather than being
+    clamped) and x is scaled per row so no fp16 partial sum overflows; error is ~1e-3 of fp32."""
+    if _packed_linear_wanted(x, weight):
+        weight = weight.to(dtype=torch.float16, memory_format=torch.contiguous_format)
+        return quant_ops.ck.fp16_packed_linear(x, weight, bias, out_dtype=x.dtype)
+    return torch.nn.functional.linear(x, weight, bias)
+
+
+def _packed_conv_wanted(conv, x, weight):
+    """kitchen's fp16 conv3d runs on the packed-fp16 GEMM where _packed_linear_wanted would, as an
+    implicit GEMM: no im2col buffer, and 3-4.5x MIOpen's conv at Wan VAE shapes on gfx1010. Its
+    gather reads 32 input channels at a time."""
+    return (_CK_PACKED and x.is_cuda and not comfy.model_management.in_training
+            and x.dtype == torch.float16 and weight.dtype == torch.float16 and x.shape[1] % 32 == 0
+            and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
+            and all(d == 1 for d in conv.dilation)
+            and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
+
+
+def dense_conv(conv, x, weight, bias=None):
+    """conv2d or conv3d on kitchen's fp16 conv3d, a 2D conv as one frame. Its epilogue writes 8
+    output channels at a time, so others (an RGB head) are zero-padded up to that and dropped."""
+    flat = x.dim() == 4
+    padding, stride = tuple(conv.padding), tuple(conv.stride)
+    if flat:
+        x, weight = x.unsqueeze(2), weight.unsqueeze(2)
+        padding, stride = (0, *padding), (1, *stride)
+    k = weight.shape[0]
+    if k % 8:
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 0, 0, 8 - k % 8))
+        bias = None if bias is None else torch.nn.functional.pad(bias, (0, 8 - k % 8))
+    out = quant_ops.ck.fp16_conv3d(x, weight, bias, stride=stride, padding=padding)[:, :k]
+    return out.squeeze(2) if flat else out
+
+
 def _fp16_linear_wanted(x):
     """kitchen's fp16-accumulate GEMM replaces a plain linear when the user opted into
         fp16 accumulation and the activation is fp16 on CUDA; weights come through cast_bias_weight."""
@@ -1060,7 +1118,7 @@ def linear_input_act_(x, weight, bias, input_act=None, act_weight=None, act_eps=
     its norm-weight cast context; a tensor uses the supplied act_eps directly.
     """
     if input_act is None and residual is None:
-        return torch.nn.functional.linear(x, weight, bias)
+        return dense_linear(x, weight, bias)
 
     if (comfy.model_management.in_training
             or not isinstance(weight, QuantizedTensor)
@@ -1069,9 +1127,10 @@ def linear_input_act_(x, weight, bias, input_act=None, act_weight=None, act_eps=
         x = _eager_input_act(x, input_act, act_weight, act_eps)
         if (not comfy.model_management.in_training
                 and not isinstance(weight, QuantizedTensor)
-                and fp16_accumulation and _fp16_linear_wanted(x)):
+                and fp16_accumulation and _fp16_linear_wanted(x)
+                and not _packed_linear_wanted(x, weight)):
             return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
-        return _linear_residual(torch.nn.functional.linear(x, weight, bias), residual, residual_scale)
+        return _linear_residual(dense_linear(x, weight, bias), residual, residual_scale)
 
     qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
     with _input_act_weight(x, input_act, act_weight, act_eps) as (act_weight, act_eps):
@@ -1443,7 +1502,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 return _quantized_weight_state_dict(self, sd, prefix, extra_quant_params=("input_scale", "pre_quant_scale"))
 
             def _forward(self, input, weight, bias):
-                return torch.nn.functional.linear(input, weight, bias)
+                return dense_linear(input, weight, bias)
 
             def forward_comfy_cast_weights(
                 self,
