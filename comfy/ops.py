@@ -618,7 +618,7 @@ class disable_weight_init:
 
         def _conv_forward(self, input, weight, bias):
             if _packed_conv_wanted(self, input, weight):
-                return dense_conv(self, input, weight, bias)
+                return dense_conv(input, weight, bias, self.stride, self.padding)
             return super()._conv_forward(input, weight, bias)
 
         def forward_comfy_cast_weights(self, input):
@@ -640,7 +640,7 @@ class disable_weight_init:
             if autopad == "causal_zero":
                 weight = weight[:, :, -input.shape[2]:, :, :]
             if _packed_conv_wanted(self, input, weight):
-                return dense_conv(self, input, weight, bias)
+                return dense_conv(input, weight, bias, self.stride, self.padding)
             if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
                 out = torch.cudnn_convolution(input, weight, self.padding, self.stride, self.dilation, self.groups, benchmark=False, deterministic=False, allow_tf32=True)
                 if bias is not None:
@@ -1049,19 +1049,19 @@ def dense_linear(x, weight, bias=None):
 def _packed_conv_wanted(conv, x, weight):
     """kitchen's fp16 conv3d runs on the packed-fp16 GEMM where _packed_linear_wanted would, as an
     implicit GEMM: no im2col buffer, and 3-4.5x MIOpen's conv at Wan VAE shapes on gfx1010. Its
-    gather reads 32 input channels at a time."""
-    return (_CK_PACKED and x.is_cuda and not comfy.model_management.in_training
+    gather reads 32 input channels at a time. The conv runs on weight's device."""
+    return (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
             and x.dtype == torch.float16 and weight.dtype == torch.float16 and x.shape[1] % 32 == 0
             and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
             and all(d == 1 for d in conv.dilation)
-            and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
+            and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device))
 
 
-def dense_conv(conv, x, weight, bias=None):
+def dense_conv(x, weight, bias, stride, padding):
     """conv2d or conv3d on kitchen's fp16 conv3d, a 2D conv as one frame. Its epilogue writes 8
     output channels at a time, so others (an RGB head) are zero-padded up to that and dropped."""
     flat = x.dim() == 4
-    padding, stride = tuple(conv.padding), tuple(conv.stride)
+    padding, stride = tuple(padding), tuple(stride)
     if flat:
         x, weight = x.unsqueeze(2), weight.unsqueeze(2)
         padding, stride = (0, *padding), (1, *stride)
