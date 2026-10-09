@@ -598,6 +598,11 @@ class disable_weight_init:
         def reset_parameters(self):
             return None
 
+        def _conv_forward(self, input, weight, bias):
+            if _packed_conv_wanted(self, input, weight):
+                return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
+            return super()._conv_forward(input, weight, bias)
+
         def forward_comfy_cast_weights(self, input):
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                 return self._conv_forward(input, weight, bias)
@@ -615,7 +620,7 @@ class disable_weight_init:
 
         def _conv_forward(self, input, weight, bias):
             if _packed_conv_wanted(self, input, weight):
-                return dense_conv(input, weight, bias, self.stride, self.padding)
+                return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             return super()._conv_forward(input, weight, bias)
 
         def forward_comfy_cast_weights(self, input):
@@ -637,7 +642,7 @@ class disable_weight_init:
             if autopad == "causal_zero":
                 weight = weight[:, :, -input.shape[2]:, :, :]
             if _packed_conv_wanted(self, input, weight):
-                return dense_conv(input, weight, bias, self.stride, self.padding)
+                return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
                 out = torch.cudnn_convolution(input, weight, self.padding, self.stride, self.dilation, self.groups, benchmark=False, deterministic=False, allow_tf32=True)
                 if bias is not None:
@@ -1040,30 +1045,32 @@ def dense_linear(x, weight, bias=None):
 
 
 def _packed_conv_wanted(conv, x, weight):
-    """kitchen's fp16 conv3d runs on the packed-fp16 GEMM where _packed_linear_wanted would, as an
-    implicit GEMM: no im2col buffer, and 3-4.5x MIOpen's conv at Wan VAE shapes on gfx1010. Its
-    gather reads 32 input channels at a time. The conv runs on weight's device."""
+    """kitchen's packed conv3d runs on the packed-fp16 GEMM where _packed_linear_wanted would, as
+    an implicit GEMM: no im2col workspace (MIOpen's fp32 one is 9x a 3x3 conv's input), 3-4.5x
+    MIOpen's fp16 conv at Wan VAE shapes and up to 40x its dilated fp32 conv1d at audio VAE shapes
+    on gfx1010. Its gather reads 32 input channels at a time. The conv runs on weight's device."""
     return (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
-            and x.dtype == torch.float16 and weight.dtype == torch.float16 and x.shape[1] % 32 == 0
+            and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
+            and not isinstance(weight, QuantizedTensor) and x.shape[1] % 32 == 0
             and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
-            and all(d == 1 for d in conv.dilation)
             and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device))
 
 
-def dense_conv(x, weight, bias, stride, padding):
-    """conv2d or conv3d on kitchen's fp16 conv3d, a 2D conv as one frame. Its epilogue writes 8
-    output channels at a time, so others (an RGB head) are zero-padded up to that and dropped."""
-    flat = x.dim() == 4
-    padding, stride = tuple(padding), tuple(stride)
-    if flat:
-        x, weight = x.unsqueeze(2), weight.unsqueeze(2)
-        padding, stride = (0, *padding), (1, *stride)
+def dense_conv(x, weight, bias, stride, padding, dilation):
+    """conv1d, conv2d or conv3d on kitchen's packed conv3d, in x's dtype, the missing leading
+    spatial dims as size one. The weight is taken to fp16 as in dense_linear. The epilogue writes
+    8 output channels at a time, so others (an RGB head) are zero-padded up to that and dropped."""
+    lead = (1,) * (5 - x.dim())
+    x = x.reshape(*x.shape[:2], *lead, *x.shape[2:])
+    weight = weight.to(torch.float16).reshape(*weight.shape[:2], *lead, *weight.shape[2:])
+    zeros = tuple(0 for _ in lead)
     k = weight.shape[0]
     if k % 8:
         weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 0, 0, 8 - k % 8))
         bias = None if bias is None else torch.nn.functional.pad(bias, (0, 8 - k % 8))
-    out = quant_ops.ck.fp16_conv3d(x, weight, bias, stride=stride, padding=padding)[:, :k]
-    return out.squeeze(2) if flat else out
+    out = quant_ops.ck.fp16_packed_conv3d(x, weight, bias, (*lead, *stride), (*zeros, *padding),
+                                          (*lead, *dilation))[:, :k]
+    return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
 
 
 def _fp16_linear_wanted(x):
